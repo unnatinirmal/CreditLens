@@ -43,6 +43,13 @@ def derive(raw: dict) -> dict:
         v["gross_profit"] = g("revenue") - g("cogs")
 
     da = g("depreciation_amortization") or 0.0
+    # by-nature P&L (Ind AS schedule III etc.) reports "Total expenses"; opex is
+    # what is left after cost of sales, D&A and finance costs. More reliable than
+    # summing the individually classified expense lines, which rarely all match.
+    if g("total_expenses") is not None:
+        opex = g("total_expenses") - (g("cogs") or 0.0) - da - (g("interest_expense") or 0.0)
+        if opex >= 0:
+            v["sga"] = opex
     if g("ebitda") is None and g("ebit") is not None:
         v["ebitda"] = g("ebit") + da
     if g("ebit") is None and g("ebitda") is not None:

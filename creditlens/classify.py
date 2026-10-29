@@ -64,10 +64,10 @@ _RULES: list[tuple[str, str, set | None]] = [
      T.CF_CFI, T.CF_SECTIONS),
     (r"cash flows? (from|used).*financ|net cash.*financ|financing activities",
      T.CF_CFF, T.CF_SECTIONS),
-    (r"(purchase|acquisition|addition).*(propert|plant|equipment|fixed asset|ppe|"
+    (r"(purchase|acquisition|addition|expenditure (for|on)).*(propert|plant|equipment|fixed asset|ppe|"
      r"tangible|intangible|capital work)|capital expenditure|capex|payment for.*(propert|"
      r"fixed asset)", T.CF_CAPEX, T.CF_SECTIONS),
-    (r"dividend.*(paid|distribut)|payment of dividend|dividend to shareholder",
+    (r"^(?!proceeds)(.*dividend.*(paid|distribut)|payment of dividend|dividend to shareholder)",
      T.CF_DIVIDENDS, T.CF_SECTIONS),
     (r"interest paid|finance cost.*paid", T.CF_INTEREST_PAID, T.CF_SECTIONS),
 
@@ -86,12 +86,13 @@ _RULES: list[tuple[str, str, set | None]] = [
      r"ebit\b|earnings before interest and tax", T.IS_EBIT, T.INCOME_SECTIONS),
     (r"finance cost|interest expense|interest on (borrowing|debt|loan)|interest and finance|"
      r"borrowing cost", T.IS_INTEREST_EXPENSE, T.INCOME_SECTIONS),
+    (r"^total expenses$|^total expenditure$", T.IS_TOTAL_EXPENSES, T.INCOME_SECTIONS),
     (r"(selling|distribution|administrat|admin|employee benefit|staff|personnel|wages|"
      r"salaries|other|operating|overhead|marketing|rent|power and fuel|freight).*"
      r"(expense|cost)|expenses$|sg ?a|opex", T.IS_OPEX, T.INCOME_SECTIONS),
     (r"profit before (tax|income tax)|income before (tax|income tax)|pre tax|pbt|"
-     r"earnings before tax", T.IS_PRETAX, T.INCOME_SECTIONS),
-    (r"exceptional item|share of (profit|loss).*associat|fair value|foreign exchange|"
+     r"earnings before tax|^profit (loss )?before (share|exceptional)", T.IS_PRETAX, T.INCOME_SECTIONS),
+    (r"exceptional item|share of (net )?(profit|loss).*(associat|joint venture)|fair value|foreign exchange|"
      r"other non operating|non operating", T.IS_OTHER_NONOP, T.INCOME_SECTIONS),
     (r"tax expense|income tax|provision for (income )?tax|current tax|deferred tax|taxation",
      T.IS_TAX, T.INCOME_SECTIONS),
@@ -177,12 +178,38 @@ def classify_label(norm_label: str, section: str = T.SEC_UNKNOWN) -> tuple[str, 
                 role = "subtotal"
             return cat, role
 
-    for pat, mapping, fallback in _AMBIG:
-        if re.search(pat, norm_label):
-            cat = mapping.get(section, fallback)
-            return cat, T.default_role(cat)
+    if section in T.BALANCE_SECTIONS:      # bare "Borrowings" in a cash-flow statement is not debt
+        for pat, mapping, fallback in _AMBIG:
+            if re.search(pat, norm_label):
+                cat = mapping.get(section, fallback)
+                return cat, T.default_role(cat)
 
     return T.IGNORE, "ignore"
+
+
+# a line's own section beats a keyword's usual side of the balance sheet
+# (e.g. non-current trade receivables, current "other financial assets")
+_SECTION_SIDE: dict[str, dict[str, str]] = {
+    T.SEC_ASSETS_NONCURRENT: {T.BA_RECEIVABLES: T.BA_OTHER_NCA, T.BA_OTHER_CA: T.BA_OTHER_NCA,
+                              T.BA_STI: T.BA_OTHER_NCA, T.BA_INVENTORY: T.BA_OTHER_NCA},
+    T.SEC_ASSETS_CURRENT: {T.BA_OTHER_NCA: T.BA_OTHER_CA},
+    T.SEC_LIAB_NONCURRENT: {T.BL_PAYABLES: T.BL_OTHER_NCL, T.BL_OTHER_CL: T.BL_OTHER_NCL,
+                            T.BL_STD: T.BL_LTD},
+    T.SEC_LIAB_CURRENT: {T.BL_OTHER_NCL: T.BL_OTHER_CL, T.BL_LTD: T.BL_STD},
+}
+# unclassified figures inside a statement section still belong to that section
+_SECTION_DEFAULT = {T.SEC_ASSETS_CURRENT: T.BA_OTHER_CA, T.SEC_ASSETS_NONCURRENT: T.BA_OTHER_NCA,
+                    T.SEC_LIAB_CURRENT: T.BL_OTHER_CL, T.SEC_LIAB_NONCURRENT: T.BL_OTHER_NCL}
+
+
+def classify_in_section(norm_label: str, section: str) -> tuple[str, str]:
+    cat, role = classify_label(norm_label, section)
+    if cat == T.IGNORE and section in _SECTION_DEFAULT and norm_label \
+            and not norm_label.startswith(("total ", "sub total", "subtotal")):
+        cat = _SECTION_DEFAULT[section]
+        return cat, T.default_role(cat)
+    new = _SECTION_SIDE.get(section, {}).get(cat)
+    return (new, role) if new else (cat, role)
 
 
 # --------------------------------------------------------------------------- #
@@ -191,9 +218,10 @@ def classify_label(norm_label: str, section: str = T.SEC_UNKNOWN) -> tuple[str, 
 _SINGLETON_PREFERENCE: dict[str, str] = {
     T.IS_REVENUE: r"revenue from operation|net sales|turnover",
     T.IS_NET_INCOME: r"profit for the (year|period)|profit after tax|net profit",
-    T.IS_PRETAX: r"profit before tax|pbt",
+    T.IS_PRETAX: r"^profit (loss )?before tax|pbt",
+    T.EQ_TOTAL: r"^total equity$",
     T.IS_EBIT: r"operating profit|profit from operation",
-    T.CF_CFO: r"net cash (from|used).*operat",
+    T.CF_CFO: r"^net cash.*operat",
 }
 
 
@@ -237,17 +265,23 @@ class ClassifiedRow:
     source: str = "rule"          # rule | llm | user
     note: str = ""
 
+    @property
+    def key(self) -> str:
+        """Row identity: the same label can appear in several sections (e.g.
+        'Borrowings' under both current and non-current liabilities)."""
+        return f"{self.section}|{self.norm}"
+
 
 def classify_rows(rows: list[ClassifiedRow], periods: list[str],
                   overrides: dict[str, tuple[str, str]] | None = None) -> list[ClassifiedRow]:
-    """Apply rule classification (respecting user/LLM overrides keyed by norm label)."""
+    """Apply rule classification (respecting user/LLM overrides keyed by row key)."""
     overrides = overrides or {}
     for r in rows:
-        if r.norm in overrides:
-            r.category, r.role = overrides[r.norm]
+        if r.key in overrides:
+            r.category, r.role = overrides[r.key]
             r.source = "user"
         elif r.source in ("rule", ""):
-            r.category, r.role = classify_label(r.norm, r.section)
+            r.category, r.role = classify_in_section(r.norm, r.section)
             r.source = "rule"
     resolve_singletons(rows, periods)
     return rows

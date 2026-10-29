@@ -31,7 +31,14 @@ from creditlens.memo import (
     model_name,
 )
 from creditlens.model import derive
-from creditlens.parser import extract_files
+from creditlens.parser import extract_files, extract_frames, read_workbook
+from creditlens.pdf_ingest import (
+    PdfIngestError,
+    PdfResult,
+    fetch_pdf,
+    page_texts,
+    read_annual_report,
+)
 from creditlens.ratios import RATIO_BY_KEY, by_category, compute_all, fmt
 from creditlens.sample import (
     SAMPLE_COMPANY,
@@ -82,8 +89,9 @@ def _init_state() -> None:
     ss.setdefault("mode", None)          # "upload" | "manual"
     ss.setdefault("rows", [])            # list[ClassifiedRow]
     ss.setdefault("periods", [])         # list[Period]
-    ss.setdefault("overrides", {})       # norm-label -> (category, role)
+    ss.setdefault("overrides", {})       # row key -> (category, role)
     ss.setdefault("warnings", [])
+    ss.setdefault("ingest_notes", [])    # one line per annual-report PDF read
     ss.setdefault("manual_periods", {})  # period -> canonical dict
     ss.setdefault("company", "")
     ss.setdefault("industry", "")
@@ -95,7 +103,7 @@ def _init_state() -> None:
 def _load_sample() -> None:
     rows, periods, warns = extract_files([("northwind_sample.xlsx", sample_workbook_xlsx())])
     st.session_state.update(
-        mode="upload", rows=rows, periods=periods, overrides={}, warnings=warns,
+        mode="upload", rows=rows, periods=periods, overrides={}, warnings=warns, ingest_notes=[],
         company=SAMPLE_COMPANY, industry=SAMPLE_INDUSTRY, currency="USD", unit_label=SAMPLE_UNIT)
 
 
@@ -106,6 +114,92 @@ def _start_manual() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# ingest - workbooks, annual-report PDFs and PDF links
+# --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False, max_entries=20)
+def _cached_texts(name: str, data: bytes) -> list[str]:
+    return page_texts(name, data)
+
+
+@st.cache_data(show_spinner=False, ttl=3600, max_entries=20)
+def _cached_fetch(url: str) -> tuple[str, bytes]:
+    return fetch_pdf(url)
+
+
+@st.cache_data(show_spinner=False, max_entries=40)
+def _cached_report(name: str, data: bytes, basis: str, use_claude: bool, spec: str) -> PdfResult:
+    return read_annual_report(name, data, basis, use_claude, spec, _cached_texts(name, data))
+
+
+def _ingest(ups, links: list[str], basis: str, use_claude: bool, page_specs: dict[str, str]) -> None:
+    sources: list[tuple[str, dict]] = []
+    reports: list[PdfResult] = []
+    warns: list[str] = []
+    pdfs: list[tuple[str, str, bytes]] = []          # (spec key, name, bytes)
+    for f in ups:
+        if f.name.lower().endswith(".pdf"):
+            pdfs.append((f.name, f.name, f.getvalue()))
+        else:
+            try:
+                sources.append((f.name, read_workbook(f.getvalue(), f.name)))
+            except Exception as exc:
+                warns.append(f"{f.name}: could not read ({exc}).")
+
+    with st.sidebar.status("Reading files…", expanded=True) as status:
+        for url in links:
+            status.write(f"Downloading {url}")
+            try:
+                name, data = _cached_fetch(url)
+                pdfs.append((url, name, data))
+            except PdfIngestError as exc:
+                warns.append(str(exc))
+        for key, name, data in pdfs:
+            status.write(f"Finding the {basis} statements in {name}…")
+            try:
+                try:
+                    rep = _cached_report(name, data, basis, use_claude, page_specs.get(key, ""))
+                except MemoConfigError as exc:
+                    warns.append(f"{name}: {exc} Fell back to reading the PDF text.")
+                    rep = _cached_report(name, data, basis, False, page_specs.get(key, ""))
+            except PdfIngestError as exc:
+                warns.append(str(exc))
+                continue
+            reports.append(rep)
+            warns.extend(rep.warnings)
+        status.update(label="Done", state="complete", expanded=False)
+
+    # newest report last so its (possibly restated) comparatives win the merge
+    reports.sort(key=lambda r: r.latest_year)
+    sources += [(r.name, r.sheets) for r in reports]
+    rows, periods, more = extract_frames(sources)
+    warns += more
+    if not periods:
+        st.sidebar.error("Could not find any statement figures. " + " ".join(warns))
+        return
+
+    ss = st.session_state
+    notes = [f"**{r.name}** — {basis} · " + ", ".join(
+        f"{k} p.{v[0]}" + (f"–{v[-1]}" if len(v) > 1 else "") for k, v in r.pages.items())
+        + f" · read via {'Claude' if r.method == 'claude' else 'PDF text'}" for r in reports]
+    units = {r.unit for r in reports if r.unit}
+    if len(units) > 1:
+        warns.append(f"Reports use different units ({', '.join(sorted(units))}) - figures are not "
+                     "comparable across years until converted.")
+    update = dict(mode="upload", rows=rows, periods=periods, overrides={}, warnings=warns,
+                  ingest_notes=notes)
+    if reports:
+        newest = reports[-1]
+        if newest.currency:
+            update["currency"] = newest.currency
+        if newest.unit:
+            update["unit_label"] = newest.unit
+        if newest.company and not ss.company:
+            update["company"] = newest.company
+    ss.update(update)
+    st.sidebar.success(f"{len(rows)} line items · {len(periods)} year(s).")
+
+
+# --------------------------------------------------------------------------- #
 # sidebar - data
 # --------------------------------------------------------------------------- #
 def sidebar_data() -> None:
@@ -113,18 +207,30 @@ def sidebar_data() -> None:
     st.sidebar.caption(f"v{__version__} · credit risk & stress-testing")
 
     st.sidebar.subheader("1 · Financial statements")
+    basis = st.sidebar.radio("Annual-report figures", ["Consolidated", "Standalone"],
+                             horizontal=True, key="basis",
+                             help="Which set of statements to read from annual-report PDFs.")
     ups = st.sidebar.file_uploader(
-        "Upload annual-report statements (.xlsx / .csv). Multiple files are merged by year.",
-        type=["xlsx", "xls", "csv"], accept_multiple_files=True)
-    if ups and st.sidebar.button("Process files", width="stretch", type="primary"):
-        files = [(f.name, f.getvalue()) for f in ups]
-        rows, periods, warns = extract_files(files)
-        if not periods:
-            st.sidebar.error("Could not find any period columns. " + " ".join(warns))
-        else:
-            st.session_state.update(mode="upload", rows=rows, periods=periods,
-                                    overrides={}, warnings=warns)
-            st.sidebar.success(f"{len(rows)} line items · {len(periods)} year(s).")
+        "Upload annual reports (.pdf) or statements (.xlsx / .csv). Multiple files are merged by year.",
+        type=["pdf", "xlsx", "xls", "csv"], accept_multiple_files=True)
+    links_txt = st.sidebar.text_area("…or annual-report PDF links (one per line)", height=80,
+                                     placeholder="https://company.com/annual-report-2023-24.pdf")
+    links = [ln.strip() for ln in links_txt.splitlines() if ln.strip()]
+    pdf_names = [f.name for f in ups or [] if f.name.lower().endswith(".pdf")] + links
+    page_specs: dict[str, str] = {}
+    use_claude = False
+    if pdf_names:
+        use_claude = st.sidebar.checkbox(
+            "Read PDF tables with Claude", value=api_key_present(), disabled=not api_key_present(),
+            help="More robust on unusual layouts (sends only the statement pages). "
+                 "Without an API key the PDF text layer is parsed directly.")
+        with st.sidebar.expander("PDF page ranges (optional)"):
+            st.caption("Leave blank to find the statements automatically. Otherwise give the "
+                       "printed-PDF page numbers, e.g. `245-252`.")
+            for n in pdf_names:
+                page_specs[n] = st.text_input(n, key=f"pages::{n}")
+    if (ups or links) and st.sidebar.button("Process", width="stretch", type="primary"):
+        _ingest(ups or [], links, basis.lower(), use_claude, page_specs)
 
     c1, c2 = st.sidebar.columns(2)
     c1.button("Load sample", width="stretch", on_click=_load_sample)
@@ -235,10 +341,12 @@ def tab_statements(plabels, derived, agg):
             st.rerun()
         except MemoConfigError as exc:
             st.error(str(exc))
-    n_over = sum(1 for r in ss.rows if r.norm in ss.overrides)
+    n_over = sum(1 for r in ss.rows if r.key in ss.overrides)
     b3.caption(f"{len(ss.rows)} rows · {n_over} overridden · "
                f"{sum(1 for r in ss.rows if r.role == 'value' and r.category != T.IGNORE)} feed the model")
 
+    for note in ss.ingest_notes:
+        st.caption("📄 " + note)
     if ss.warnings:
         with st.expander("Parser warnings"):
             for w in ss.warnings:
@@ -248,7 +356,7 @@ def tab_statements(plabels, derived, agg):
         [{"Line item": r.label, "Section": r.section,
           "Category": T.CATEGORY_LABELS.get(r.category, r.category), "Role": r.role,
           **{pl: r.values.get(pl) for pl in plabels}} for r in ss.rows],
-        index=[r.norm for r in ss.rows])
+        index=[r.key for r in ss.rows])
     edited = st.data_editor(
         grid, width="stretch", hide_index=True, num_rows="fixed",
         disabled=["Line item", "Section"] + plabels,
@@ -258,14 +366,14 @@ def tab_statements(plabels, derived, agg):
             **{pl: st.column_config.NumberColumn(pl, format="%.1f") for pl in plabels}},
         key="classgrid")
 
-    by_norm = {r.norm: r for r in ss.rows}
+    by_key = {r.key: r for r in ss.rows}
     changed = False
-    for norm, erow in edited.iterrows():
+    for key, erow in edited.iterrows():
         new_cat = LABEL_TO_CAT.get(erow["Category"])
         new_role = erow["Role"]
-        cur = by_norm.get(norm)
+        cur = by_key.get(key)
         if cur and new_cat and (new_cat != cur.category or new_role != cur.role):
-            ss.overrides[norm] = (new_cat, new_role)
+            ss.overrides[key] = (new_cat, new_role)
             changed = True
     if changed:
         st.rerun()

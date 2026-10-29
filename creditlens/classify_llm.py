@@ -1,6 +1,6 @@
 """Optional Claude-assisted pre-classification of raw statement rows.
 
-Returns a mapping of normalised label -> (category, role) that the caller merges
+Returns a mapping of row key -> (category, role) that the caller merges
 into the rule-based classification (rules stay as the fallback and for any label
 Claude does not return).
 """
@@ -29,11 +29,11 @@ def _catalogue() -> str:
 def build_prompt(rows: list[ClassifiedRow], periods: list[str]) -> str:
     seen: dict[str, ClassifiedRow] = {}
     for r in rows:
-        seen.setdefault(r.norm, r)
+        seen.setdefault(r.key, r)
     lines = []
-    for r in seen.values():
+    for i, r in enumerate(seen.values(), 1):
         sample = next((f"{p}={r.values[p]:,.0f}" for p in periods if r.values.get(p) is not None), "")
-        lines.append(f'- "{r.label}"  (section: {r.section}; {sample})')
+        lines.append(f'- r{i}: "{r.label}"  (section: {r.section}; {sample})')
     return f"""Assign every line item below to exactly one category id and a role.
 
 CATEGORIES:
@@ -56,7 +56,7 @@ RULES:
 LINE ITEMS:
 {chr(10).join(lines)}
 
-Reply with a JSON object mapping the EXACT line-item text to {{"category": "<id>", "role": "<role>"}}.
+Reply with a JSON object mapping each row id (r1, r2, ...) to {{"category": "<id>", "role": "<role>"}}.
 No prose, no markdown fences."""
 
 
@@ -90,19 +90,16 @@ def llm_classify(rows: list[ClassifiedRow], periods: list[str]) -> dict[str, tup
     except (json.JSONDecodeError, ValueError) as exc:
         raise MemoConfigError(f"Could not parse Claude's classification response: {exc}") from exc
 
-    label_to_norm = {}
-    from .classify import normalize
-    for r in rows:
-        label_to_norm[r.label] = r.norm
+    # same ids build_prompt assigned: first occurrence order of each row key
+    id_to_key = {f"r{i}": k for i, k in enumerate(dict.fromkeys(r.key for r in rows), 1)}
 
     out: dict[str, tuple[str, str]] = {}
-    for label, spec in data.items():
-        if not isinstance(spec, dict):
+    for rid, spec in data.items():
+        if not isinstance(spec, dict) or rid not in id_to_key:
             continue
         cat = spec.get("category")
         role = spec.get("role", "value")
         if cat not in _VALID or role not in _ROLES:
             continue
-        norm = label_to_norm.get(label) or normalize(label)
-        out[norm] = (cat, role)
+        out[id_to_key[rid]] = (cat, role)
     return out

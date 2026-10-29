@@ -10,6 +10,7 @@ IS_REVENUE = "is.revenue"
 IS_COGS = "is.cogs"
 IS_GROSS_PROFIT = "is.gross_profit"
 IS_OPEX = "is.opex"                       # operating expenses EXCLUDING D&A
+IS_TOTAL_EXPENSES = "is.total_expenses"   # reported total of all P&L expenses (Ind AS / by-nature)
 IS_DA = "is.depreciation_amortization"
 IS_OTHER_OP_INCOME = "is.other_operating_income"
 IS_EBIT = "is.ebit"
@@ -58,6 +59,7 @@ CATEGORY_LABELS: dict[str, str] = {
     IS_COGS: "Cost of sales / materials",
     IS_GROSS_PROFIT: "Gross profit (subtotal)",
     IS_OPEX: "Operating expenses (ex-D&A)",
+    IS_TOTAL_EXPENSES: "Total expenses (reported)",
     IS_DA: "Depreciation & amortisation",
     IS_OTHER_OP_INCOME: "Other operating income",
     IS_EBIT: "EBIT / operating profit (subtotal)",
@@ -100,7 +102,7 @@ CATEGORY_LABELS: dict[str, str] = {
 
 # grid dropdown grouping / order
 CATEGORY_GROUPS: list[tuple[str, list[str]]] = [
-    ("Income statement", [IS_REVENUE, IS_COGS, IS_GROSS_PROFIT, IS_OPEX, IS_DA,
+    ("Income statement", [IS_REVENUE, IS_COGS, IS_GROSS_PROFIT, IS_OPEX, IS_TOTAL_EXPENSES, IS_DA,
                           IS_OTHER_OP_INCOME, IS_EBIT, IS_EBITDA, IS_INTEREST_EXPENSE,
                           IS_INTEREST_INCOME, IS_OTHER_NONOP, IS_PRETAX, IS_TAX, IS_NET_INCOME]),
     ("Assets", [BA_CASH, BA_STI, BA_RECEIVABLES, BA_INVENTORY, BA_OTHER_CA, BA_CA_TOTAL,
@@ -114,7 +116,7 @@ ALL_CATEGORIES = [c for _, cats in CATEGORY_GROUPS for c in cats]
 
 # categories that must appear at most once per period - if the classifier finds
 # several, it keeps the best-matching row and demotes the rest to "subtotal".
-SINGLETON = {IS_REVENUE, IS_GROSS_PROFIT, IS_EBIT, IS_EBITDA, IS_PRETAX, IS_NET_INCOME,
+SINGLETON = {IS_REVENUE, IS_TOTAL_EXPENSES, IS_GROSS_PROFIT, IS_EBIT, IS_EBITDA, IS_PRETAX, IS_NET_INCOME,
              BA_TOTAL_ASSETS, BL_TOTAL_LIAB, EQ_TOTAL, CF_CFO, CF_CFI, CF_CFF}
 
 # categories that are always reconciliation-only (never summed into an aggregate)
@@ -138,7 +140,7 @@ SUPPRESSED_BY = {EQ_COMPONENTS: EQ_TOTAL}
 # bucket -> canonical key consumed by model.derive() / ratios / scoring
 CATEGORY_TO_CANONICAL: dict[str, str] = {
     IS_REVENUE: "revenue", IS_COGS: "cogs", IS_GROSS_PROFIT: "gross_profit",
-    IS_OPEX: "sga", IS_DA: "depreciation_amortization", IS_EBIT: "ebit",
+    IS_OPEX: "sga", IS_TOTAL_EXPENSES: "total_expenses", IS_DA: "depreciation_amortization", IS_EBIT: "ebit",
     IS_EBITDA: "ebitda", IS_INTEREST_EXPENSE: "interest_expense",
     IS_INTEREST_INCOME: "interest_income", IS_PRETAX: "pretax_income",
     IS_TAX: "tax_expense", IS_NET_INCOME: "net_income",

@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from . import taxonomy as T
 from .classify import ClassifiedRow, detect_section, normalize, section_from_sheet_name
 
 _NUM_RE = re.compile(r"[^0-9.\-]")
@@ -120,6 +121,10 @@ def _extract_sheet(df: pd.DataFrame, file: str, sheet: str,
         return [], [], start_rid
 
     section = section_from_sheet_name(sheet)
+    # a sheet named after one statement stays in that statement: a stray heading
+    # such as a wrapped "Assets (Net)" line in a cash-flow statement must not
+    # switch it to balance-sheet sections
+    family = _family(section)
     rows: list[ClassifiedRow] = []
     rid = start_rid
     for i in range(hrow + 1, len(df)):
@@ -131,7 +136,9 @@ def _extract_sheet(df: pd.DataFrame, file: str, sheet: str,
         values = {p.key: parse_number(df.iat[i, c]) for c, p in period_cols}
         has_num = any(v is not None for v in values.values())
         if not has_num:
-            section = detect_section(norm, section)  # header / section row
+            new = detect_section(norm, section)  # header / section row
+            if family is None or _family(new) == family:
+                section = new
             continue
         rows.append(ClassifiedRow(
             rid=f"{file}|{sheet}|{rid}", file=file, sheet=sheet, label=label,
@@ -140,7 +147,17 @@ def _extract_sheet(df: pd.DataFrame, file: str, sheet: str,
     return rows, [p for _, p in period_cols], rid
 
 
-def _read_workbook(data: bytes, name: str) -> dict[str, pd.DataFrame]:
+def _family(section: str) -> str | None:
+    if section == T.SEC_UNKNOWN:
+        return None
+    for name, fam in (("cf", T.CF_SECTIONS), ("income", T.INCOME_SECTIONS),
+                      ("balance", T.BALANCE_SECTIONS)):
+        if section in fam:
+            return name
+    return None
+
+
+def read_workbook(data: bytes, name: str) -> dict[str, pd.DataFrame]:
     buf = io.BytesIO(data)
     if name.lower().endswith(".csv"):
         return {"csv": pd.read_csv(buf, header=None, dtype=object)}
@@ -151,17 +168,27 @@ def _read_workbook(data: bytes, name: str) -> dict[str, pd.DataFrame]:
 def extract_files(files: list[tuple[str, bytes]]) -> tuple[list[ClassifiedRow], list[Period], list[str]]:
     """files: list of (name, bytes), earliest-uploaded first. Later files win on
     (normalised label, period) overlaps."""
+    sources: list[tuple[str, dict[str, pd.DataFrame]]] = []
+    warnings: list[str] = []
+    for name, data in files:
+        try:
+            sources.append((name, read_workbook(data, name)))
+        except Exception as exc:
+            warnings.append(f"{name}: could not read ({exc}).")
+    rows, periods, more = extract_frames(sources)
+    return rows, periods, warnings + more
+
+
+def extract_frames(sources: list[tuple[str, dict[str, pd.DataFrame]]]
+                   ) -> tuple[list[ClassifiedRow], list[Period], list[str]]:
+    """sources: list of (file name, {sheet name: raw sheet frame}), lowest priority
+    first. Later sources win on (normalised label, period) overlaps."""
     all_rows: list[ClassifiedRow] = []
     period_by_key: dict[int, Period] = {}
     warnings: list[str] = []
     rid = 0
 
-    for name, data in files:
-        try:
-            sheets = _read_workbook(data, name)
-        except Exception as exc:
-            warnings.append(f"{name}: could not read ({exc}).")
-            continue
+    for name, sheets in sources:
         file_rows = 0
         for sheet, df in sheets.items():
             try:
@@ -180,15 +207,15 @@ def extract_files(files: list[tuple[str, bytes]]) -> tuple[list[ClassifiedRow], 
     key_to_label = {p.key: p.label for p in periods}
 
     # merge duplicates across files (values are keyed by fiscal-year int here):
-    # a later file overrides a value for the same (normalised label, year).
+    # a later file overrides a value for the same (section, normalised label, year).
     merged: dict[str, ClassifiedRow] = {}
     for r in all_rows:
-        if r.norm not in merged:
-            merged[r.norm] = ClassifiedRow(
+        if r.key not in merged:
+            merged[r.key] = ClassifiedRow(
                 rid=r.rid, file=r.file, sheet=r.sheet, label=r.label, norm=r.norm,
                 section=r.section, values=dict(r.values))
         else:
-            tgt = merged[r.norm]
+            tgt = merged[r.key]
             for k, v in r.values.items():
                 if v is not None:
                     tgt.values[k] = v
