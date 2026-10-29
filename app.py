@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover
 from creditlens import __version__, charts
 from creditlens.classify import aggregate, classify_rows, reconciliation
 from creditlens.classify_llm import llm_classify
+from creditlens.memo_template import generate_template_memo
 from creditlens.memo import (
     MemoConfigError,
     MemoContext,
@@ -221,7 +222,7 @@ def sidebar_data() -> None:
     use_claude = False
     if pdf_names:
         use_claude = st.sidebar.checkbox(
-            "Read PDF tables with Claude", value=api_key_present(), disabled=not api_key_present(),
+            "Read PDF tables with Claude", value=False, disabled=not api_key_present(),
             help="More robust on unusual layouts (sends only the statement pages). "
                  "Without an API key the PDF text layer is parsed directly.")
         with st.sidebar.expander("PDF page ranges (optional)"):
@@ -245,8 +246,9 @@ def sidebar_data() -> None:
     st.session_state.currency = cc1.text_input("Currency", st.session_state.currency)
     st.session_state.unit_label = cc2.text_input("Units", st.session_state.unit_label)
 
-    st.sidebar.caption("Claude memo: " + ("✅ key detected · `%s`" % model_name()
-                                          if api_key_present() else "⚠️ set ANTHROPIC_API_KEY"))
+    st.sidebar.caption("Claude features: " + ("✅ key detected · `%s`" % model_name()
+                                               if api_key_present() else
+                                               "off (optional) - everything else works without a key"))
 
 
 # --------------------------------------------------------------------------- #
@@ -709,25 +711,30 @@ def tab_memo(plabels, derived, ratios, scores, focus):
                                      "covenant-lite TLB; cyclical end-markets.")
     ctx = _build_ctx(sel, derived, ratios, scores, plabels, notes)
 
-    if not api_key_present():
-        st.warning("Memo generation is disabled — set `ANTHROPIC_API_KEY` and restart.")
-        with st.expander("Prompt preview (what would be sent to Claude)"):
-            from creditlens.memo import build_prompt
-            st.code(build_prompt(ctx), language="markdown")
-        return
+    engines = ["Template (offline, no API key)"]
+    if api_key_present():
+        engines.append(f"Claude ({model_name()})")
+    engine = st.radio("Memo engine", engines, horizontal=True,
+                      help="The template memo is rule-based: every sentence is driven by the computed "
+                           "ratios, score and stress tests. Claude writes a more analyst-like draft "
+                           "but needs an API key with credit.")
+    use_claude = engine.startswith("Claude")
 
     if st.button("Generate credit review memo", type="primary"):
-        sig = hashlib.md5((str(ctx.values) + notes + sel + model_name()
-                           + str([s.composite for s in scores.values()])).encode()).hexdigest()
-        cache = st.session_state.memo_cache
-        if sig not in cache:
-            with st.spinner(f"Drafting with {model_name()}…"):
-                try:
-                    cache[sig] = generate_memo(ctx)
-                except MemoConfigError as exc:
-                    st.error(str(exc))
-                    return
-        st.session_state["last_memo"] = cache[sig]
+        if not use_claude:
+            st.session_state["last_memo"] = generate_template_memo(ctx)
+        else:
+            sig = hashlib.md5((str(ctx.values) + notes + sel + model_name()
+                               + str([s.composite for s in scores.values()])).encode()).hexdigest()
+            cache = st.session_state.memo_cache
+            if sig not in cache:
+                with st.spinner(f"Drafting with {model_name()}…"):
+                    try:
+                        cache[sig] = generate_memo(ctx)
+                    except MemoConfigError as exc:
+                        st.error(f"{exc}  \nTip: switch to the template engine - it needs no API key.")
+                        return
+            st.session_state["last_memo"] = cache[sig]
 
     if st.session_state.get("last_memo"):
         st.divider()

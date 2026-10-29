@@ -2,11 +2,16 @@
 
 **Automated Credit Risk Assessment & Scenario Stress-Tester.**
 
-Upload a company's financial statements as they appear in the annual report —
-granular line items, one or more year columns, one or more files. CreditLens
-categorises them itself, computes the full ratio set, a transparent 0–100 credit
-score with an indicative rating, multi-year comparison charts, live stress-test
-heatmaps, and a Claude-drafted credit review memo.
+Upload a company's **annual-report PDFs** (or paste links to them) and choose
+**Consolidated** or **Standalone** figures — or upload the statements as
+spreadsheets. CreditLens finds the financial statements inside the report,
+categorises every line item itself, computes the full ratio set, a transparent
+0–100 credit score with an indicative rating, multi-year comparison charts, live
+stress-test heatmaps, and a committee-style credit review memo.
+
+Everything runs locally with **no API key**. Claude (Anthropic API) is an
+optional add-on for reading unusual PDF layouts and writing a more analyst-like
+memo.
 
 ![Streamlit app](https://img.shields.io/badge/Streamlit-app-brightgreen)
 
@@ -16,6 +21,7 @@ heatmaps, and a Claude-drafted credit review memo.
 
 | Area | Detail |
 | --- | --- |
+| **Annual-report PDFs** | Upload one or more annual reports or paste **direct PDF links**; pick **Consolidated** or **Standalone**. CreditLens locates the balance sheet, P&L and cash-flow pages among hundreds of pages (by content, not page titles), reads the tables, and merges several years — the newest report wins on overlapping (restated) years. Currency and units (₹ crore / lakh / million) are detected. Optional page-range override for unusual reports. |
 | **Flexible ingest** | `.xlsx` / `.csv`, **multiple files** merged by fiscal year (newest file wins on overlap), multiple sheets per file, statements stacked in one sheet with section headers, and 1–N period columns. Year headers like `FY2023`, `2023`, `31 March 2023`, `2023-24`, `FY23` are all understood. |
 | **Auto-categorisation** | A rule engine maps every row to a taxonomy bucket and rolls buckets up into the aggregates the ratio engine needs. *All current-asset lines → current assets; all liability lines except long-term debt → current liabilities;* current portion of long-term debt and current leases → short-term debt; reported subtotals (`Total current assets`, …) are kept for reconciliation, not double-counted. |
 | **Review & correct** | A grid shows every row with its detected **category** and **role** (`value` / `subtotal` / `ignore`) — change any of them and the ratios recompute immediately. **Pre-classify with Claude** pre-fills the mappings for messy labels (falls back to rules with no API key). A reconciliation panel flags where classified aggregates disagree with the file's own totals. |
@@ -24,7 +30,7 @@ heatmaps, and a Claude-drafted credit review memo.
 | **Multi-year comparison** | Turn on **Comparison mode** and pick 2–5 years. The Overview, Ratios and Credit-score tabs switch to side-by-side tables, trend charts, ratio heatmaps and the score/rating path. |
 | **Data visualisation** | Overview tab carries charts as well as the KPI row — revenue & margin trend, margin bridge, capital-structure stack, leverage-vs-coverage, score path, cash-flow bars (multi-year); profitability waterfall + asset-mix / funding donuts (single year). |
 | **Scenario stress-testing** | Sliders for revenue decline, EBITDA decline, EBITDA-margin compression, interest-rate shock (bps + floating-rate share), capex change and incremental debt. Base→stressed deltas plus an **EBITDA-decline × rate-shock heatmap** that recolours instantly, with your slider scenario marked on the grid, plus three preset macro scenarios. |
-| **Claude credit memo** | `claude-opus-5` drafts a structured committee-style memo (exec summary & recommendation, business/financial profile, leverage, coverage, liquidity, cash flow, scenario analysis, risks & mitigants, suggested covenants, rating rationale) from the metrics, the multi-year trend and your deal notes. Downloadable as Markdown. |
+| **Credit memo** | A ten-section committee-style memo (exec summary & recommendation, business/financial profile, leverage, coverage, liquidity, cash flow, scenario analysis, risks & mitigants, suggested covenants, rating rationale). The default **template engine** is rule-based and offline: recommendation from the rating band and stress resilience, drivers from the score components, trends across years, covenant levels calibrated off current ratios, and break-points found by re-running the stress model. With an API key, **Claude** can draft it instead. Downloadable as Markdown. |
 
 ---
 
@@ -40,7 +46,11 @@ streamlit run app.py
 Sidebar → **Load sample** to explore a worked 5-year example (a deteriorating
 mid-market manufacturer, A → B over FY2020–24).
 
-### Enabling the Claude features
+### Optional: Claude features
+
+Not needed to run the app. With an Anthropic API key (with credit) you can
+also read PDF tables with Claude, pre-classify line items with Claude, and have
+Claude draft the memo.
 
 ```bash
 setx ANTHROPIC_API_KEY "sk-ant-..."     # Windows (new shell after)
@@ -51,6 +61,32 @@ or copy `.env.example` → `.env`, or add it to `.streamlit/secrets.toml`.
 `CREDITLENS_MODEL` overrides the model (e.g. `claude-sonnet-5`).
 
 ---
+
+## Annual-report PDFs
+
+1. Choose **Consolidated** or **Standalone** at the top of the sidebar.
+2. Upload the annual-report PDFs and/or paste direct `.pdf` links, one per line.
+3. Click **Process**. Each report's detected pages are listed on the
+   **Statements** tab (e.g. *Balance Sheet p.245–246, Profit and Loss p.247,
+   Cash Flows p.251–252*).
+
+How it works: every page's text layer is scanned for statement signatures
+(`Total assets` + equity/liabilities lines, `Revenue from operations` + `Profit
+before tax`, operating/investing/financing activities) with dense figures;
+notes, auditor's report and the statement of changes in equity are excluded.
+The balance sheet for the chosen basis anchors the search, and the P&L and cash
+flow are taken from the pages that follow. Rows are parsed as
+`label [note ref] current-year prior-year`, handling Indian digit grouping
+(`2,58,911`), `(1,234)` negatives, `-` for nil, footnote markers and wrapped
+labels.
+
+Tested on Wipro (FY23, FY24) and Reliance Industries (FY24), both bases — the
+extracted figures match the published statements and the balance-sheet
+reconciliation ties out.
+
+Notes: scanned (image-only) PDFs have no text layer and are not supported. Some
+company websites block automated downloads — the app says so; download the PDF
+in your browser and upload it instead.
 
 ## Uploading your own statements
 
@@ -97,6 +133,7 @@ and cash held flat, rate shock on the floating-rate share of debt); see
 ```
 app.py                  Streamlit UI (6 tabs)
 creditlens/
+  pdf_ingest.py         annual-report PDFs: fetch links, locate statements, parse tables
   taxonomy.py           line-item buckets + roll-up to canonical keys
   classify.py           rule engine, section detection, aggregation, reconciliation
   classify_llm.py       optional Claude pre-classification
@@ -106,7 +143,8 @@ creditlens/
   scoring.py            weighted credit score -> rating band
   stress.py             StressParams, apply_stress(), heatmap_frame()
   charts.py             matplotlib figure builders
-  memo.py               Claude prompt (incl. multi-year trend) + generate_memo()
+  memo_template.py      rule-based credit memo (offline, default)
+  memo.py               Claude memo prompt (incl. multi-year trend) + generate_memo()
   sample.py             raw 5-year sample workbook + canonical template
   schema.py             canonical line items (manual-entry path)
 ```
@@ -115,8 +153,17 @@ creditlens/
 
 - Figures are treated as one consistent unit (set the label in the sidebar); no
   unit conversion.
-- PDF annual reports are out of scope — export the statements to `.xlsx` / `.csv`.
+- PDF reading targets text-based annual reports in the usual Ind AS / IFRS
+  layout; unusual layouts may need the page-range override or a quick review of
+  the classification grid. Scanned PDFs are not supported.
+- The template memo is mechanical by design — it cannot weigh qualitative
+  factors (management, industry, documentation).
 - Auto-classification is good but not perfect on unusual labels — always review
   the grid and reconciliation panel.
-- The memo calls the Anthropic API and consumes tokens; results are cached per
-  input signature within a session.
+- The optional Claude features call the Anthropic API and consume tokens;
+  results are cached within a session.
+
+## Tech stack
+
+Python · Streamlit · pandas / NumPy · matplotlib · pypdf · openpyxl ·
+Anthropic Python SDK (optional, structured outputs for PDF table extraction).
